@@ -44,19 +44,13 @@ def root():
 def health():
     return {"status": "healthy", "meals_loaded": len(meals_store), "popularity_model_present": os.path.exists(MODEL_PATH)}
 
-@app.get("/api/meals", tags=["meals"])
-def get_meals():
-    if not meals_store:
-        raise HTTPException(status_code=500, detail="Meals not loaded.")
-    return meals_store
-
-@app.post("/run-script")
+@app.post("/Reload-meals")
 def run_script():
 
     script_path = os.path.join(os.getcwd(), "Scripts", "convert_api_data.py")
 
     try:
-        # run: python scripts/my_task.py
+        # run: python scripts/convert_api_data.py
         result = subprocess.run(
             [sys.executable, script_path],
             capture_output=True,
@@ -118,7 +112,8 @@ def generate_menu(body: dict):
         "min_meals": 50,
         "max_meals": 70,
         "dietary_balance": true,
-        "include_add_ons": false
+        "include_add_ons": false,
+        "meal_type_counts": {"Breakfast": 10, "Lunch": 20}  # NEW!
     }
     """
     if not meals_store:
@@ -128,6 +123,7 @@ def generate_menu(body: dict):
         max_meals = int(body.get("max_meals", 70))
         dietary_balance = bool(body.get("dietary_balance", True))
         include_add_ons = bool(body.get("include_add_ons", False))
+        meal_type_counts = body.get("meal_type_counts")
 
         # Load predictions if available, else empty dict
         pred_map = {}
@@ -138,7 +134,7 @@ def generate_menu(body: dict):
             pred_map = {}
 
         engine = MenuGeneratorEngine(meals_store)
-        selected = engine.generate_menu(min_meals=min_meals, max_meals=max_meals, dietary_balance=dietary_balance, include_add_ons=include_add_ons, popularity_scores=pred_map)
+        selected = engine.generate_menu(min_meals=min_meals, max_meals=max_meals, dietary_balance=dietary_balance, include_add_ons=include_add_ons, popularity_scores=pred_map, meal_type_counts=meal_type_counts)
         stats = engine.get_menu_statistics(selected)
         stats['predicted_popularity_count'] = len(pred_map)
 

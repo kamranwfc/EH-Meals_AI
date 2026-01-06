@@ -3,11 +3,10 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Set
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-import json
 import math
-import os
 
-# Import Pydantic Meal models (or define minimal compatible ones here)
+# --- MODELS ---
+
 class DietDetail(BaseModel):
     uuid: str
     name: str
@@ -35,14 +34,15 @@ class Meal(BaseModel):
     order_count: int = 0
     last_ordered: Optional[str] = None
 
-# Engine
+# --- ENGINE ---
+
 class MenuGeneratorEngine:
     """
-    Production-focused menu engine that uses predicted popularity when available.
+    Enhanced Menu Engine with Strict Meal Type Control.
     """
 
-    # Meal-type ratio (production defaults)
     MEAL_TYPE_RATIO = {"breakfast": 0.20, "lunch_dinner": 0.80}
+    
     MAJOR_DIETS_MIN_COUNTS = {
         "Gluten Free": 20,
         "Low Carb": 18,
@@ -52,7 +52,6 @@ class MenuGeneratorEngine:
         "Vegetarian": 6,
     }
 
-    # Weights: note 'pred_popularity' will be used as primary popularity signal.
     WEIGHTS = {
         "pred_popularity": 0.50,
         "recency": 0.15,
@@ -96,33 +95,23 @@ class MenuGeneratorEngine:
             return 0.0
         diff = self.now - last_dt
         days = diff.total_seconds() / 86400.0
-        if days <= 7:
-            return 1.0
-        if days <= 30:
-            return 0.6
-        if days <= 60:
-            return 0.3
+        if days <= 7: return 1.0
+        if days <= 30: return 0.6
+        if days <= 60: return 0.3
         return 0.0
 
     @staticmethod
     def _normalize_list(values: List[float]) -> List[float]:
-        if not values:
-            return []
-        mn = min(values)
-        mx = max(values)
-        if math.isclose(mx, mn):
-            return [0.5 for _ in values]
+        if not values: return []
+        mn, mx = min(values), max(values)
+        if math.isclose(mx, mn): return [0.5 for _ in values]
         return [(v - mn) / (mx - mn) for v in values]
 
     def _compute_base_metrics(self, candidates: List[Meal], predicted_popularity: Dict[str, float]):
-        pop_scores = []
-        recency_scores = []
-        diversity_scores = []
-        uuids = []
+        pop_scores, recency_scores, diversity_scores, uuids = [], [], [], []
         meal_type_counts = {}
         for m in candidates:
             uuids.append(m.uuid)
-            # Use predicted popularity if available, else fallback to raw order_count
             pop_scores.append(predicted_popularity.get(m.uuid, float(m.order_count or 0)))
             last = self.parse_datetime(m.last_ordered)
             recency_scores.append(self._recency_penalty_days(last))
@@ -132,12 +121,10 @@ class MenuGeneratorEngine:
 
     def _score_candidates(self, candidates: List[Meal], predicted_popularity: Dict[str, float], target_counts_by_type: Dict[str, int]) -> Dict[str, float]:
         uuids, pop, recency_pen, diversity, meal_type_counts = self._compute_base_metrics(candidates, predicted_popularity)
-        # Normalize popularity: if pred values seem 0-1 already, normalization will be neutral
         pop_norm = self._normalize_list(pop)
         recency_inverted = [1.0 - p for p in self._normalize_list(recency_pen)]
         diversity_norm = self._normalize_list([d for d in diversity])
 
-        # Balance boost: if type under target -> give boost
         balance_scores = []
         for m in candidates:
             t = m.meal_type.name
@@ -160,93 +147,104 @@ class MenuGeneratorEngine:
             scores[m.uuid] = score
         return scores
 
-    def generate_menu(self, min_meals: int = 50, max_meals: int = 70, dietary_balance: bool = True, include_add_ons: bool = False, popularity_scores: Optional[Dict[str, float]] = None) -> List[Meal]:
-        # Filter items
+    def _calculate_meal_type_targets(self, pool: List[Meal], max_meals: int, meal_type_counts: Optional[Dict[str, int]] = None) -> Dict[str, int]:
+        if meal_type_counts is None:
+            target_by_type = {}
+            for tname, ratio in self.MEAL_TYPE_RATIO.items():
+                target_by_type[tname] = max(1, int(round(max_meals * ratio)))
+            return target_by_type
+        
+        # User provided counts - ensure they don't exceed max_meals
+        target_by_type = {mt: count for mt, count in meal_type_counts.items()}
+        total_requested = sum(target_by_type.values())
+        
+        if total_requested > max_meals:
+            scale = max_meals / total_requested
+            for mt in target_by_type:
+                target_by_type[mt] = max(1, int(target_by_type[mt] * scale))
+        return target_by_type
+
+    def generate_menu(
+        self, 
+        min_meals: int = 50, 
+        max_meals: int = 70, 
+        dietary_balance: bool = True, 
+        include_add_ons: bool = False, 
+        popularity_scores: Optional[Dict[str, float]] = None,
+        meal_type_counts: Optional[Dict[str, int]] = None  
+    ) -> List[Meal]:
         pool = [m for m in self.meals if include_add_ons or m.meal_type.name != 'add_on_item']
         pool = self.unique_by_uuid(pool)
+        target_by_type = self._calculate_meal_type_targets(pool, max_meals, meal_type_counts)
+        pop_scores = popularity_scores or {}
+        scores = self._score_candidates(pool, pop_scores, target_by_type)
 
-        # Build meal type targets
-        target_by_type = {}
-        for tname, ratio in self.MEAL_TYPE_RATIO.items():
-            target_by_type[tname] = max(1, int(round(max_meals * ratio)))
-
-        # If popularity_scores not passed, try to load minimal fallback mapping using order_count
-        if popularity_scores is None:
-            popularity_scores = {}
-
+        # CASE 1: STRICT TYPE SELECTION (NO DIETARY BALANCE)
         if not dietary_balance:
-            scores = self._score_candidates(pool, popularity_scores, target_by_type)
-            sorted_pool = sorted(pool, key=lambda m: scores.get(m.uuid, 0), reverse=True)
-            return sorted_pool[:max_meals]
+            final_selection = []
+            selected_uuids = set()
+            
+            # Follow specified type counts exactly
+            if meal_type_counts:
+                for m_type, count in target_by_type.items():
+                    type_pool = [m for m in pool if m.meal_type.name == m_type]
+                    type_pool.sort(key=lambda m: scores.get(m.uuid, 0), reverse=True)
+                    for m in type_pool[:count]:
+                        if len(final_selection) < max_meals:
+                            final_selection.append(m)
+                            selected_uuids.add(m.uuid)
+            
+            # Fill remaining if targets didn't reach max_meals
+            if len(final_selection) < max_meals:
+                remainder = sorted(pool, key=lambda m: scores.get(m.uuid, 0), reverse=True)
+                for m in remainder:
+                    if m.uuid not in selected_uuids and len(final_selection) < max_meals:
+                        final_selection.append(m)
+            return final_selection
 
-        # Score and select with diet minima and type targets
-        scores = self._score_candidates(pool, popularity_scores, target_by_type)
-
-        # Build diet->candidates mapping
-        diet_to_candidates: Dict[str, List[str]] = {}
+        # CASE 2: DIETARY BALANCE MODE
         uuid_to_meal = {m.uuid: m for m in pool}
+        diet_to_candidates: Dict[str, List[str]] = {}
         for m in pool:
-            diet_names = [d.diet_details.name for d in m.meal_diets] if m.meal_diets else []
-            if not diet_names:
-                diet_names = ['__none__']
+            diet_names = [d.diet_details.name for d in m.meal_diets] if m.meal_diets else ['__none__']
             for dn in diet_names:
                 diet_to_candidates.setdefault(dn, []).append(m.uuid)
-        for dn, uuids in diet_to_candidates.items():
+        
+        for uuids in diet_to_candidates.values():
             uuids.sort(key=lambda u: scores.get(u, 0), reverse=True)
 
-        selected_uuids: List[str] = []
+        selected_list: List[str] = []
         selected_set: Set[str] = set()
 
-        # 1) Ensure minima for major diets
+        # Step A: Minima for Diets, respecting meal type targets
         for diet_name, min_count in self.MAJOR_DIETS_MIN_COUNTS.items():
-            candidates_for_diet = diet_to_candidates.get(diet_name, [])
-            take = min(len(candidates_for_diet), min_count)
-            for u in candidates_for_diet[:take]:
-                if u not in selected_set and len(selected_uuids) < max_meals:
-                    selected_uuids.append(u)
+            candidates = diet_to_candidates.get(diet_name, [])
+            for u in candidates:
+                if len(selected_list) >= max_meals: break
+                m = uuid_to_meal[u]
+                mt = m.meal_type.name
+                current_of_type = sum(1 for x in selected_list if uuid_to_meal[x].meal_type.name == mt)
+                
+                # Only add if we need more of this diet AND we haven't maxed out this meal type
+                if u not in selected_set and current_of_type < target_by_type.get(mt, 999):
+                    selected_list.append(u)
                     selected_set.add(u)
+                    if sum(1 for x in selected_list if any(d.diet_details.name == diet_name for d in uuid_to_meal[x].meal_diets)) >= min_count:
+                        break
 
-        # 2) Enforce meal type targets
-        type_counts = {}
-        for u in selected_uuids:
-            mt = uuid_to_meal[u].meal_type.name
-            type_counts[mt] = type_counts.get(mt, 0) + 1
+        # Step B: Fill remaining Meal Type quotas
         for mt, target in target_by_type.items():
-            need = max(0, target - type_counts.get(mt, 0))
-            if need <= 0:
-                continue
-            candidates_of_type = [m for m in pool if m.meal_type.name == mt and m.uuid not in selected_set]
-            candidates_of_type.sort(key=lambda m: scores.get(m.uuid, 0), reverse=True)
-            for m in candidates_of_type[:need]:
-                if len(selected_uuids) >= max_meals:
-                    break
-                selected_uuids.append(m.uuid)
-                selected_set.add(m.uuid)
+            current = sum(1 for x in selected_list if uuid_to_meal[x].meal_type.name == mt)
+            needed = target - current
+            if needed > 0:
+                type_pool = [m for m in pool if m.meal_type.name == mt and m.uuid not in selected_set]
+                type_pool.sort(key=lambda m: scores.get(m.uuid, 0), reverse=True)
+                for m in type_pool[:needed]:
+                    if len(selected_list) < max_meals:
+                        selected_list.append(m.uuid)
+                        selected_set.add(m.uuid)
 
-        # 3) Fill remaining slots by global score, respecting recency preference
-        if len(selected_uuids) < max_meals:
-            candidates_sorted = sorted(pool, key=lambda m: (scores.get(m.uuid, 0), -self._recency_penalty_days(self.parse_datetime(m.last_ordered))), reverse=True)
-            for m in candidates_sorted:
-                if m.uuid in selected_set:
-                    continue
-                if len(selected_uuids) >= max_meals:
-                    break
-                selected_uuids.append(m.uuid)
-                selected_set.add(m.uuid)
-
-        # 4) Ensure min_meals by relaxing constraints
-        if len(selected_uuids) < min_meals:
-            all_sorted = sorted(pool, key=lambda m: scores.get(m.uuid, 0), reverse=True)
-            for m in all_sorted:
-                if m.uuid in selected_set:
-                    continue
-                if len(selected_uuids) >= min_meals:
-                    break
-                selected_uuids.append(m.uuid)
-                selected_set.add(m.uuid)
-
-        final_meals = [uuid_to_meal[u] for u in selected_uuids]
-        return final_meals
+        return [uuid_to_meal[u] for u in selected_list]
 
     def get_menu_statistics(self, selected_meals: List[Meal]) -> Dict:
         stats = {'total_meals': len(selected_meals), 'meal_types': {}, 'dietary_options': {}, 'avg_order_count': 0}
